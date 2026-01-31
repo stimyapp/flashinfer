@@ -358,7 +358,7 @@ class FusedMoeLauncher {
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
-        static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream, enable_pdl);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1358,7 +1358,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
-        static_cast<RoutingMethodType>(routing_method_type), routing_stream);
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream, enable_pdl);
 
     check_moe();
     prepare_moe(moe_tactic);

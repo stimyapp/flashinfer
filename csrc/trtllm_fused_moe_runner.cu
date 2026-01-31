@@ -58,7 +58,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit,
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
-                 RoutingMethodType routingMethodType, cudaStream_t stream) {
+                 RoutingMethodType routingMethodType, cudaStream_t stream, bool enable_pdl) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3) {
     FLASHINFER_CHECK(topK <= 8, "For DeepSeek routing method, must have topK <= 8");
     FLASHINFER_CHECK(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
@@ -68,7 +68,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mDtypeBias = dtypeBias;  // for DeepSeek, the bias can be bfloat16 or fp32
 
     routingData.mDtypeScore = btg::Dtype::Fp32;  // for DeepSeek, the score is currently always fp32
-    routingData.mUsePdl = true;
+    routingData.mUsePdl = enable_pdl;
 
     // output:
     routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -106,7 +106,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     }
     moe::dev::routing::routingLlama4::Data routingData;
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
-    routingData.mUsePdl = true;
+    routingData.mUsePdl = enable_pdl;
 
     // output:
     routingData.mPtrTopKPacked = routingExpertIndexes;
@@ -142,7 +142,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     routingData.mDtypeExpW = btg::Dtype::Bfloat16;
     // routingData.mDtypeElt = dtypeElt; // no-op for now as hidden_state is not input
-    routingData.mUsePdl = true;
+    routingData.mUsePdl = enable_pdl;
     routingData.mDoSoftmaxBeforeTopK = routingMethodType == RoutingMethodType::RenormalizeNaive;
     routingData.mNormTopkProb = routingMethodType == RoutingMethodType::RenormalizeNaive;
     routingData.mApplySoftmaxAfterTopK = routingMethodType == RoutingMethodType::Renormalize;
@@ -402,7 +402,7 @@ Runner::Runner(btg::Dtype dtypeElt, bool useDeepSeekFp8, int32_t tileTokensDim,
 void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
                         moe::dev::convertsf::Data& convertSfData,
                         moe::dev::activation::Data& activationData,
-                        moe::dev::finalize::Data& finalizeData) {
+                        moe::dev::finalize::Data& finalizeData, bool enable_pdl) {
   // Setup sf conversion data if needed
   convertSfData.inSfPtr = args.hidden_states_scale;
   convertSfData.outSfPtr = workspace.hidden_states_scale_linear;
@@ -410,11 +410,11 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   convertSfData.numTokens = args.num_tokens;
   convertSfData.sfLayoutSrc = btg::SfLayout::R128c4;
   convertSfData.sfLayoutDst = btg::SfLayout::Linear;
-  convertSfData.mUsePdl = true;
+  convertSfData.mUsePdl = enable_pdl;
 
   // Setup activation data
   activationData.mDtypeElt = args.mDtypeElt;
-  activationData.mUsePdl = true;
+  activationData.mUsePdl = enable_pdl;
   activationData.mUseDeepSeekFp8 = true;
   activationData.inPtr = workspace.gemm1_output;
   activationData.outPtr = workspace.activation_output;
@@ -432,7 +432,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
     // Setup finalize data
     finalizeData.mDtypeElt = args.mDtypeOut;
     finalizeData.mDtypeExpW = args.mDtypeExpW;
-    finalizeData.mUsePdl = true;
+    finalizeData.mUsePdl = enable_pdl;
     finalizeData.mUseDeepSeekFp8 = false;
     finalizeData.inPtr = workspace.gemm2_output;
     finalizeData.outPtr = args.output;
@@ -511,7 +511,7 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
   moe::dev::finalize::Data finalizeData;
   moe::dev::convertsf::Data convertSfData;
   sync_check_cuda_error(stream);
-  setOpsData(args, workspace, convertSfData, activationData, finalizeData);
+  setOpsData(args, workspace, convertSfData, activationData, finalizeData, enable_pdl);
 
   void* hidden_states_scale_linear{args.hidden_states_scale};
 

@@ -128,7 +128,7 @@ class Runner {
            int32_t* ctaIdxXyToBatchIdx, int32_t* ctaIdxXyToMnLimit, int32_t* numNonExitingCtas,
            batchedGemm::trtllm::gen::Dtype dtypeElt, batchedGemm::trtllm::gen::Dtype dtypeBias,
            bool useRoutingScalesOnInput, bool useDeepSeekFp8, RoutingMethodType routingMethodType,
-           cudaStream_t stream);
+           cudaStream_t stream, bool enable_pdl = true);
 
  private:
   int32_t mTileTokensDim{8};
@@ -382,7 +382,7 @@ class Runner {
   void setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace,
                   moe::dev::convertsf::Data& convertSfData,
                   moe::dev::activation::Data& activationData,
-                  moe::dev::finalize::Data& finalizeData);
+                  moe::dev::finalize::Data& finalizeData, bool enable_pdl);
 
  private:
   PermuteGemm1::Runner mPermuteGemm1;
