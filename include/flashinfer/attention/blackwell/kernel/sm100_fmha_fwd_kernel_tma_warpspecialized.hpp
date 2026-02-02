@@ -45,6 +45,28 @@ namespace cutlass::fmha::kernel {
 using namespace cute;
 using namespace cutlass::fmha::collective;
 
+// Type trait to detect PipelineAsync (used for FP4KV K/V pipelines)
+// vs PipelineTmaUmmaAsync (used for standard TMA K/V pipelines).
+template<typename T>
+struct is_pipeline_async : cute::false_type {};
+template<int S>
+struct is_pipeline_async<cutlass::PipelineAsync<S>> : cute::true_type {};
+template<typename T>
+static constexpr bool is_pipeline_async_v = is_pipeline_async<T>::value;
+
+// Helper to construct K/V pipelines with the correct API.
+// PipelineAsync: (storage, params, barrier_init)
+// PipelineTmaUmmaAsync: (storage, params, cluster_shape, barrier_init, mask_calc)
+template<typename Pipeline, typename Storage, typename Params, typename CS>
+CUTLASS_DEVICE Pipeline make_kv_pipeline(Storage& storage, Params const& params,
+                                          [[maybe_unused]] CS cluster_shape) {
+    if constexpr (is_pipeline_async_v<Pipeline>) {
+        return Pipeline(storage, params, cute::true_type{});
+    } else {
+        return Pipeline(storage, params, cluster_shape, cute::true_type{}, cute::false_type{});
+    }
+}
+
 struct Sm100FmhaCtxKernelWarpspecializedSchedule {
   enum class WarpRole { Softmax0, Softmax1, Correction, MMA, Load, Epilogue, Empty };
 
@@ -220,16 +242,24 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       pipeline_load_k_params.role = CollectiveMainloop::PipelineK::ThreadCategory::Consumer;
       pipeline_load_v_params.role = CollectiveMainloop::PipelineV::ThreadCategory::Consumer;
     }
-    pipeline_load_k_params.is_leader = lane_predicate && (role == WarpRole::Load);
-    pipeline_load_v_params.is_leader = lane_predicate && (role == WarpRole::Load);
-    pipeline_load_k_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadK;
-    pipeline_load_v_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadV;
-    typename CollectiveMainloop::PipelineK pipeline_load_k(
-        shared_storage.pipelines.load_k, pipeline_load_k_params, ClusterShape{},
-        /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
-    typename CollectiveMainloop::PipelineV pipeline_load_v(
-        shared_storage.pipelines.load_v, pipeline_load_v_params, ClusterShape{},
-        /*barrier init*/ cute::true_type{}, /*mask calc*/ cute::false_type{});
+    // PipelineAsync (FP4KV) uses producer/consumer arrival counts.
+    // PipelineTmaUmmaAsync (standard) uses is_leader + transaction_bytes.
+    constexpr bool kv_pipeline_async = is_pipeline_async_v<typename CollectiveMainloop::PipelineK>;
+    if constexpr (!kv_pipeline_async) {
+      pipeline_load_k_params.is_leader = lane_predicate && (role == WarpRole::Load);
+      pipeline_load_v_params.is_leader = lane_predicate && (role == WarpRole::Load);
+      pipeline_load_k_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadK;
+      pipeline_load_v_params.transaction_bytes = CollectiveMainloop::TransactionBytesLoadV;
+    } else {
+      pipeline_load_k_params.producer_arv_count = NumWarpsLoad * cutlass::NumThreadsPerWarp;
+      pipeline_load_k_params.consumer_arv_count = 1 * cutlass::NumThreadsPerWarp;
+      pipeline_load_v_params.producer_arv_count = NumWarpsLoad * cutlass::NumThreadsPerWarp;
+      pipeline_load_v_params.consumer_arv_count = 1 * cutlass::NumThreadsPerWarp;
+    }
+    auto pipeline_load_k = make_kv_pipeline<typename CollectiveMainloop::PipelineK>(
+        shared_storage.pipelines.load_k, pipeline_load_k_params, ClusterShape{});
+    auto pipeline_load_v = make_kv_pipeline<typename CollectiveMainloop::PipelineV>(
+        shared_storage.pipelines.load_v, pipeline_load_v_params, ClusterShape{});
 
     typename CollectiveMainloop::PipelineS::Params pipeline_mma_s0_params;
     if (role == WarpRole::MMA) {
@@ -321,8 +351,11 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     __syncthreads();
 
     pipeline_load_q.init_masks(ClusterShape{});
-    pipeline_load_k.init_masks(ClusterShape{});
-    pipeline_load_v.init_masks(ClusterShape{});
+    // PipelineAsync (FP4KV) doesn't have init_masks; skip for K/V when async.
+    if constexpr (!kv_pipeline_async) {
+      pipeline_load_k.init_masks(ClusterShape{});
+      pipeline_load_v.init_masks(ClusterShape{});
+    }
     pipeline_mma_s0.init_masks(ClusterShape{});
     pipeline_mma_s1.init_masks(ClusterShape{});
     pipeline_mma_corr.init_masks(ClusterShape{});

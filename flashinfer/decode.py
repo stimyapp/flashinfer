@@ -2124,6 +2124,8 @@ def trtllm_batch_decode_with_kv_cache(
     mask: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
+    kv_scale_factors: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    kv_sf_scale: float = 1.0,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -2363,6 +2365,10 @@ def trtllm_batch_decode_with_kv_cache(
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
 
+        # Extract FP4 KV scale factor tensors
+        k_sf = kv_scale_factors[0] if kv_scale_factors is not None else None
+        v_sf = kv_scale_factors[1] if kv_scale_factors is not None else None
+
         run_func(
             out,
             out_scale_factor,
@@ -2387,6 +2393,9 @@ def trtllm_batch_decode_with_kv_cache(
             workspace_buffer.numel() * workspace_buffer.element_size(),
             sinks,
             cum_seq_lens_q,
+            k_sf,
+            v_sf,
+            kv_sf_scale,
         )
 
         return (

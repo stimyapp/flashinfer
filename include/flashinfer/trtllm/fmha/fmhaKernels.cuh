@@ -55,8 +55,8 @@ using flashinfer::trtllm_cubin_loader::getCubin;
 // Check if two SM values are family/specific versions of the same architecture
 // Returns true only if one is a family version and the other is a compatible specific version
 constexpr bool isFamilySpecificSMPair(int sm1, int sm2) {
-  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103)) ||
-      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103))) {
+  if ((sm1 == kSM_100f && (sm2 == kSM_100 || sm2 == kSM_103 || sm2 == kSM_120)) ||
+      (sm2 == kSM_100f && (sm1 == kSM_100 || sm1 == kSM_103 || sm1 == kSM_120))) {
     return true;
   }
   return false;
@@ -67,6 +67,8 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
     return kernelSM == kSM_100f || kernelSM == kSM_103;
   } else if (gpuSM == kSM_100) {
     return kernelSM == kSM_100f || kernelSM == kSM_100;
+  } else if (gpuSM == kSM_120) {
+    return kernelSM == kSM_100f || kernelSM == kSM_120;
   }
 
   return gpuSM == kernelSM;

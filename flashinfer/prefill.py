@@ -3322,6 +3322,118 @@ def fmha_varlen(
     return out, lse
 
 
+def fmha_varlen_fp4kv(
+    q: torch.Tensor,
+    k_e2m1: torch.Tensor,
+    v_e2m1: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_sf: torch.Tensor,
+    qo_segment_offsets: torch.Tensor,
+    kv_segment_offsets: torch.Tensor,
+    plan_info=None,
+    max_qo_len: Optional[int] = None,
+    out: Optional[torch.Tensor] = None,
+    lse: Optional[torch.Tensor] = None,
+    causal: bool = False,
+    sm_scale: Optional[float] = None,
+    q_scale: Optional[float] = None,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """CUTLASS FMHA with E2M1 (FP4) KV cache.
+
+    Q is FP8 E4M3, K/V are E2M1 packed with FP8 E4M3 per-block scale factors.
+    Output is BF16. K/V are dequantized to FP8 in shared memory before MMA.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        FP8 E4M3 query [total_qo, num_qo_heads, head_dim_qk]
+    k_e2m1 : torch.Tensor
+        uint8 packed E2M1 key [total_kv, num_kv_heads, head_dim/2]
+    v_e2m1 : torch.Tensor
+        uint8 packed E2M1 value [total_kv, num_kv_heads, head_dim/2]
+    k_sf : torch.Tensor
+        uint8 FP8 E4M3 key scale factors [total_kv, num_kv_heads, head_dim/16]
+    v_sf : torch.Tensor
+        uint8 FP8 E4M3 value scale factors [total_kv, num_kv_heads, head_dim/16]
+    qo_segment_offsets : torch.Tensor
+        Segment offsets for Q/O sequences
+    kv_segment_offsets : torch.Tensor
+        Segment offsets for K/V sequences
+    """
+    workspace_buffer = _get_cache_buf(
+        "fmha_varlen_cutlass_fp4kv_workspace", 32 * 1024 * 1024, q.device
+    )
+    module = get_fmha_module(
+        q.dtype,
+        q.dtype,  # kv_dtype matches q for CUTLASS dispatch (FP8)
+        torch.bfloat16,  # output dtype
+        torch.int32,
+        q.shape[2],
+        q.shape[2],  # head_dim_vo == head_dim_qk for now
+        PosEncodingMode.NONE.value,
+        False,
+        False,
+        q.device,
+    )
+
+    nnz_qo, num_qo_heads, head_dim_qk = q.shape
+    head_dim_vo = head_dim_qk
+
+    mask_mode_code = 1 if causal else 0
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim_qk)
+    if q_scale is None:
+        q_scale = 1.0
+
+    if max_qo_len is None:
+        max_qo_len = torch.max(qo_segment_offsets[1:] - qo_segment_offsets[:-1]).item()
+
+    if plan_info is None:
+        plan_info = fmha_varlen_plan(
+            module, qo_segment_offsets, kv_segment_offsets, num_qo_heads, causal
+        )
+
+    work_indptr, qo_tile_indices, head_indices, batch_indices = plan_info
+
+    if out is None:
+        out = torch.empty(
+            nnz_qo + max(max_qo_len, 128),
+            num_qo_heads,
+            head_dim_vo,
+            device=q.device,
+            dtype=torch.bfloat16,
+        )[max(max_qo_len, 128):]
+
+    if lse is None and return_lse:
+        lse = torch.empty(
+            nnz_qo, num_qo_heads, device=q.device, dtype=torch.float32
+        )
+
+    module.run_fp4kv(
+        workspace_buffer,
+        q,
+        k_e2m1,
+        v_e2m1,
+        k_sf,
+        v_sf,
+        qo_segment_offsets,
+        kv_segment_offsets,
+        work_indptr,
+        qo_tile_indices,
+        head_indices,
+        batch_indices,
+        out,
+        lse,
+        mask_mode_code,
+        sm_scale,
+        q_scale,
+        max_qo_len,
+    )
+
+    return out, lse
+
+
 @functools.cache
 def get_trtllm_gen_fmha_module():
     mod = gen_trtllm_gen_fmha_module()
@@ -3487,6 +3599,8 @@ def trtllm_batch_context_with_kv_cache(
     kv_layout: str = "HND",
     enable_pdl: Optional[bool] = None,
     sinks: Optional[List[torch.Tensor]] = None,
+    kv_scale_factors: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    kv_sf_scale: float = 1.0,
 ) -> Union[torch.Tensor, FP4Tensor]:
     """
     Parameters
@@ -3648,6 +3762,10 @@ def trtllm_batch_context_with_kv_cache(
         bmm1_scale = bmm1_scale * log2e
     if isinstance(bmm2_scale, torch.Tensor):
         assert bmm2_scale.dtype == torch.float32
+    # Extract FP4 KV scale factor tensors
+    k_sf = kv_scale_factors[0] if kv_scale_factors is not None else None
+    v_sf = kv_scale_factors[1] if kv_scale_factors is not None else None
+
     workspace_size = workspace_buffer.numel() * workspace_buffer.element_size()
     run_func(
         out,
@@ -3673,6 +3791,9 @@ def trtllm_batch_context_with_kv_cache(
         enable_pdl,
         workspace_size,
         sinks,
+        k_sf,
+        v_sf,
+        kv_sf_scale,
     )
     return (
         out

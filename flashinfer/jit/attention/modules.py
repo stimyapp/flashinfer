@@ -1753,6 +1753,8 @@ def gen_fmha_cutlass_sm100a_module(
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10, 11, 12]
     )
+    # Enable E2M1 (FP4) KV cache support for CUTLASS FMHA
+    nvcc_flags = nvcc_flags + ["-DFLASHINFER_ENABLE_FP4_E2M1"]
     return gen_jit_spec(
         uri,
         source_paths,

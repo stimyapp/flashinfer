@@ -32,3 +32,29 @@ void blackwell_fmha_plan(TensorView qo_segment_offsets, TensorView kv_segment_of
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, FMHACutlassSM100Run);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(plan, blackwell_fmha_plan);
+
+#if defined(FLASHINFER_ENABLE_FP4_E2M1)
+
+void FMHACutlassSM100RunFP4KV(
+    TensorView workspace_buffer,
+    TensorView q,           // FP8 E4M3
+    TensorView k,           // uint8 packed E2M1
+    TensorView v,           // uint8 packed E2M1
+    TensorView k_sf,        // uint8 FP8 E4M3 scale factors
+    TensorView v_sf,        // uint8 FP8 E4M3 scale factors
+    TensorView qo_segment_offsets,
+    TensorView kv_segment_offsets,
+    TensorView work_indptr,
+    TensorView qo_tile_indices,
+    TensorView qo_head_indices,
+    TensorView batch_indices,
+    TensorView o,           // BF16 output
+    Optional<TensorView> maybe_lse,
+    int64_t mask_mode_code,
+    double sm_scale,
+    double scale_q,
+    int64_t max_qo_len);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fp4kv, FMHACutlassSM100RunFP4KV);
+
+#endif  // FLASHINFER_ENABLE_FP4_E2M1
