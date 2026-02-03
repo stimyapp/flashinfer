@@ -16,7 +16,6 @@
 #pragma once
 
 #include <cstdint>
-#include <vector>
 
 #include "../../allocator.h"
 #include "sm120_kernel_traits.cuh"
@@ -90,11 +89,16 @@ __global__ void sm120_fmha_fp4kv_kernel(
                lse_ptr, o_ptr, o_stride_n, o_stride_h);
 }
 
-// Runner for SM120 FMHA FP4KV
+// Runner for SM120 FMHA FP4KV with block-scaled FP4 QK MMA.
+//
+// DTypeQ is BF16 (nv_bfloat16). Q is quantized to E2M1 on-the-fly inside
+// the kernel by the producer warps. The QK GEMM uses block-scaled FP4×FP4
+// MMA with per-16-element UE4M3 scale factors applied in hardware.
+// PV GEMM remains FP8×FP8 (V dequanted E2M1→FP8).
 template <typename DTypeQ, typename DTypeOut, typename IdType, class TileShapeQK,
           class TileShapePV, class ActiveMask>
 struct FwdRunnerFP4KV_SM120 {
-  using Element = DTypeQ;  // FP8 E4M3
+  using Element = DTypeQ;  // BF16
 
   static constexpr int CTA_Q = get<0>(TileShapeQK{});
   static constexpr int CTA_KV = get<1>(TileShapeQK{});
@@ -104,9 +108,11 @@ struct FwdRunnerFP4KV_SM120 {
   // (SM120 uses single-buffered SMEM with __syncthreads coordination).
   static constexpr int NUM_STAGES = 1;
 
+  // DTypeKV is float_e4m3_t: V is dequanted to FP8 in SMEM; PV MMA uses FP8.
+  // DTypeQ is BF16: Q is loaded from GMEM as BF16, quantized to E2M1 in SMEM.
   using Ktraits = flashinfer::SM120AttentionKernelTraits<
       HEAD_DIM_QK, HEAD_DIM_VO, CTA_Q, CTA_KV, NUM_STAGES,
-      Element, Element, DTypeOut, IdType, void>;
+      Element, cutlass::float_e4m3_t, DTypeOut, IdType, void>;
 
   using Mainloop = SM120FmhaFwdMainloopFP4KV<Ktraits, ActiveMask>;
 
@@ -130,7 +136,6 @@ struct FwdRunnerFP4KV_SM120 {
                          float* maybe_lse,
                          int mask_mode_code,
                          double sm_scale,
-                         double q_scale,
                          int num_qo_heads,
                          int num_kv_heads,
                          int head_dim_qk,
@@ -149,6 +154,7 @@ struct FwdRunnerFP4KV_SM120 {
                          int total_qo_len,
                          int total_kv_len,
                          int max_qo_len,
+                         int num_work_items_precomputed,
                          cudaStream_t stream) {
     int h_r = num_qo_heads / num_kv_heads;
     assert(num_qo_heads % num_kv_heads == 0);
@@ -165,6 +171,9 @@ struct FwdRunnerFP4KV_SM120 {
     auto stride_V = make_stride(_1{}, head_dim_vo, make_stride(_0{}, num_kv_heads * head_dim_vo));
     auto layout_V = make_layout(shape_V, stride_V);
 
+    // scale_softmax = sm_scale (no q_scale needed — Q is quantized to E2M1
+    // inside the kernel, with per-block UE4M3 scale factors applied by the
+    // block-scaled MMA instruction in hardware).
     typename Mainloop::Arguments mainloop_args{
         q, layout_Q, layout_K, layout_V,
         k_e2m1, v_e2m1, k_sf, v_sf,
@@ -173,7 +182,6 @@ struct FwdRunnerFP4KV_SM120 {
         k_sf_stride_n, k_sf_stride_h,
         v_sf_stride_n, v_sf_stride_h,
         static_cast<float>(sm_scale),
-        static_cast<float>(q_scale),
         1.0f, 1.0f, 1.0f};
 
     // Convert arguments to params
@@ -185,27 +193,13 @@ struct FwdRunnerFP4KV_SM120 {
     auto mainloop_params = Mainloop::to_underlying_arguments(
         dummy_problem_shape, mainloop_args, workspace_buffer);
 
-    // Compute total work items from segment offsets.
-    // Each batch element produces ceil(qo_len / CTA_Q) tiles per QO head.
-    // We compute this directly rather than reading from work_indptr, because
-    // the plan kernel uses num_ctas as its bucket count (which differs from
-    // num_qo_heads * batch_size).
-    std::vector<IdType> h_qo_seg(batch_size + 1);
-    cudaMemcpyAsync(h_qo_seg.data(), qo_segment_offsets,
-                    (batch_size + 1) * sizeof(IdType), cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-    int num_work_items = 0;
-    for (int b = 0; b < batch_size; ++b) {
-      int qo_len_b = h_qo_seg[b + 1] - h_qo_seg[b];
-      num_work_items += (qo_len_b + CTA_Q - 1) / CTA_Q;
-    }
-    num_work_items *= num_qo_heads;
+    // num_work_items is pre-computed by the plan kernel and equals the
+    // length of qo_tile_indices. Passed in directly to avoid a D2H sync.
+    int num_work_items = num_work_items_precomputed;
 
     if (num_work_items == 0) return cudaSuccess;
 
     // Compute shared memory size.
-    // Accumulator buffers (acc_o, row_max, row_sum) now live in per-thread
-    // registers, so only the mainloop SharedStorage is needed in SMEM.
     constexpr int smem_mainloop = sizeof(typename Mainloop::SharedStorage);
     constexpr int smem_total = smem_mainloop;
 
@@ -253,7 +247,7 @@ cudaError_t run_fmha_fwd_fp4kv_sm120(
     IdType* work_indptr, IdType* qo_tile_indices,
     IdType* qo_head_indices, IdType* batch_indices,
     DTypeOut* o, float* maybe_lse,
-    int mask_mode_code, double sm_scale, double q_scale,
+    int mask_mode_code, double sm_scale,
     int num_qo_heads, int num_kv_heads,
     int head_dim_qk, int head_dim_vo,
     int q_stride_n, int q_stride_h,
@@ -262,20 +256,21 @@ cudaError_t run_fmha_fwd_fp4kv_sm120(
     int k_sf_stride_n, int k_sf_stride_h,
     int v_sf_stride_n, int v_sf_stride_h,
     int batch_size, int total_qo_len, int total_kv_len,
-    int max_qo_len, cudaStream_t stream) {
+    int max_qo_len, int num_work_items_precomputed, cudaStream_t stream) {
   return FwdRunnerFP4KV_SM120<DTypeQ, DTypeOut, IdType, TileShapeQK, TileShapePV,
                                 ActiveMask>::run(
       workspace_buffer, q, k_e2m1, v_e2m1, k_sf, v_sf,
       qo_segment_offsets, kv_segment_offsets, work_indptr,
       qo_tile_indices, qo_head_indices, batch_indices,
-      o, maybe_lse, mask_mode_code, sm_scale, q_scale,
+      o, maybe_lse, mask_mode_code, sm_scale,
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
       q_stride_n, q_stride_h,
       k_e2m1_stride_n, k_e2m1_stride_h,
       v_e2m1_stride_n, v_e2m1_stride_h,
       k_sf_stride_n, k_sf_stride_h,
       v_sf_stride_n, v_sf_stride_h,
-      batch_size, total_qo_len, total_kv_len, max_qo_len, stream);
+      batch_size, total_qo_len, total_kv_len, max_qo_len,
+      num_work_items_precomputed, stream);
 }
 
 }  // namespace flashinfer

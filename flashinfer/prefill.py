@@ -3348,18 +3348,19 @@ def fmha_varlen_fp4kv(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     sm_scale: Optional[float] = None,
-    q_scale: Optional[float] = None,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-    """CUTLASS FMHA with E2M1 (FP4) KV cache.
+    """CUTLASS FMHA with E2M1 (FP4) KV cache using block-scaled FP4 QK MMA.
 
-    Q is FP8 E4M3, K/V are E2M1 packed with FP8 E4M3 per-block scale factors.
-    Output is BF16. K/V are dequantized to FP8 in shared memory before MMA.
+    On SM120, Q is BF16 and quantized to E2M1 on-the-fly inside the kernel.
+    The QK GEMM uses block-scaled FP4×FP4 MMA with per-16-element UE4M3 scale
+    factors applied in hardware. PV GEMM uses FP8×FP8 (V dequanted E2M1→FP8).
+    Output is BF16.
 
     Parameters
     ----------
     q : torch.Tensor
-        FP8 E4M3 query [total_qo, num_qo_heads, head_dim_qk]
+        BF16 query [total_qo, num_qo_heads, head_dim_qk]
     k_e2m1 : torch.Tensor
         uint8 packed E2M1 key [total_kv, num_kv_heads, head_dim/2]
     v_e2m1 : torch.Tensor
@@ -3373,12 +3374,16 @@ def fmha_varlen_fp4kv(
     kv_segment_offsets : torch.Tensor
         Segment offsets for K/V sequences
     """
+    # Ensure Q is BF16 for block-scaled FP4 QK MMA
+    if q.dtype != torch.bfloat16:
+        q = q.to(torch.bfloat16)
+
     workspace_buffer = _get_cache_buf(
         "fmha_varlen_cutlass_fp4kv_workspace", 32 * 1024 * 1024, q.device
     )
     module = get_fmha_module(
         q.dtype,
-        q.dtype,  # kv_dtype matches q for CUTLASS dispatch (FP8)
+        q.dtype,
         torch.bfloat16,  # output dtype
         torch.int32,
         q.shape[2],
@@ -3395,8 +3400,6 @@ def fmha_varlen_fp4kv(
     mask_mode_code = 1 if causal else 0
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim_qk)
-    if q_scale is None:
-        q_scale = 1.0
 
     if max_qo_len is None:
         max_qo_len = torch.max(qo_segment_offsets[1:] - qo_segment_offsets[:-1]).item()
@@ -3417,6 +3420,10 @@ def fmha_varlen_fp4kv(
         )
 
     work_indptr, qo_tile_indices, head_indices, batch_indices = plan_info
+
+    # work_indptr[-1] = total work items (pre-computed by plan kernel).
+    # Pass it to the C++ runner to avoid a D2H sync inside the kernel launch.
+    num_work_items = work_indptr[-1].item()
 
     if out is None:
         out = torch.empty(
@@ -3449,8 +3456,8 @@ def fmha_varlen_fp4kv(
         lse,
         mask_mode_code,
         sm_scale,
-        q_scale,
         max_qo_len,
+        num_work_items,
     )
 
     return out, lse

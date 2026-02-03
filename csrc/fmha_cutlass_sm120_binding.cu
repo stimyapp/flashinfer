@@ -44,8 +44,8 @@ void FMHACutlassSM120RunFP4KV(
     Optional<TensorView> maybe_lse,
     int64_t mask_mode_code,
     double sm_scale,
-    double scale_q,
-    int64_t max_qo_len);
+    int64_t max_qo_len,
+    int64_t num_work_items);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fp4kv, FMHACutlassSM120RunFP4KV);
 

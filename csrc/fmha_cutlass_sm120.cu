@@ -39,10 +39,6 @@ using tvm::ffi::Optional;
       constexpr int HEAD_DIM_QK = 128;                                                    \
       constexpr int HEAD_DIM_VO = 128;                                                    \
       return __VA_ARGS__();                                                               \
-    } else if (head_dim_qk == 64 && head_dim_vo == 64) {                                  \
-      constexpr int HEAD_DIM_QK = 64;                                                     \
-      constexpr int HEAD_DIM_VO = 64;                                                     \
-      return __VA_ARGS__();                                                               \
     }                                                                                     \
     return false;                                                                         \
   }()
@@ -54,7 +50,7 @@ using namespace cutlass::fmha::collective;
 
 void FMHACutlassSM120RunFP4KV(
     ffi::TensorView workspace_buffer,
-    ffi::TensorView q,           // FP8 E4M3 [total_qo, num_qo_heads, head_dim_qk]
+    ffi::TensorView q,           // BF16 [total_qo, num_qo_heads, head_dim_qk]
     ffi::TensorView k,           // uint8 packed E2M1 [total_kv, num_kv_heads, head_dim/2]
     ffi::TensorView v,           // uint8 packed E2M1 [total_kv, num_kv_heads, head_dim/2]
     ffi::TensorView k_sf,        // uint8 FP8 E4M3 [total_kv, num_kv_heads, head_dim/16]
@@ -69,8 +65,8 @@ void FMHACutlassSM120RunFP4KV(
     Optional<ffi::TensorView> maybe_lse,
     int64_t mask_mode_code,
     double sm_scale,
-    double scale_q,
-    int64_t max_qo_len) {
+    int64_t max_qo_len,
+    int64_t num_work_items) {
   MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
   int total_qo_len = q.size(0);
   int total_kv_len = k.size(0);
@@ -97,9 +93,12 @@ void FMHACutlassSM120RunFP4KV(
 
   DISPATCH_mask_mode(mask_mode, MASK_MODE, [&] {
     return DISPATCH_head_dim_fp4kv(head_dim_qk, head_dim_vo, HEAD_DIM_QK, HEAD_DIM_VO, [&] {
-      using cutlass_type_q = cutlass_dtype_t<__nv_fp8_e4m3>;
+      // Q is BF16 (quantized to E2M1 inside the kernel by producer warps)
+      using cutlass_type_q = cutlass_dtype_t<nv_bfloat16>;
       using cutlass_type_out = cutlass_dtype_t<nv_bfloat16>;
-      // SM120 tile sizes: smaller than SM100 to fit in 101KB SMEM
+      // SM120 tile sizes for FP8 MMA.
+      // P (FP8) overlay requires CTA_KV <= HEAD_DIM_QK.
+      // CTA_KV=64 balances parallelism vs tile overhead.
       using TILE_Q = cute::Int<128>;
       using TILE_KV = cute::Int<64>;
       using D_QK = cute::Int<HEAD_DIM_QK>;
@@ -125,14 +124,15 @@ void FMHACutlassSM120RunFP4KV(
           static_cast<int*>(batch_indices.data_ptr()),
           static_cast<cutlass_type_out*>(o.data_ptr()),
           maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr,
-          mask_mode_code, sm_scale, scale_q,
+          mask_mode_code, sm_scale,
           num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo,
           q_stride_n, q_stride_h,
           k_e2m1_stride_n, k_e2m1_stride_h,
           v_e2m1_stride_n, v_e2m1_stride_h,
           k_sf_stride_n, k_sf_stride_h,
           v_sf_stride_n, v_sf_stride_h,
-          batch_size, total_qo_len, total_kv_len, max_qo_len, stream);
+          batch_size, total_qo_len, total_kv_len, max_qo_len,
+          static_cast<int>(num_work_items), stream);
       TVM_FFI_ICHECK_EQ(status, cudaSuccess)
           << "SM120 CUTLASS FP4KV FMHA forward pass failed: " << cudaGetErrorString(status);
 
