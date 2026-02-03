@@ -1762,6 +1762,38 @@ def gen_fmha_cutlass_sm100a_module(
     )
 
 
+def gen_fmha_cutlass_sm120_module(
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_logits_soft_cap: bool,
+) -> JitSpec:
+    # NOTE: use a static URI for now (same as SM100a pattern)
+    uri = "fmha_cutlass_sm120"
+
+    source_paths = [
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm120.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "fmha_cutlass_sm120_binding.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "blackwell_fmha_plan.cu",
+    ]
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    # Enable E2M1 (FP4) KV cache support for SM120 FMHA
+    nvcc_flags = nvcc_flags + ["-DFLASHINFER_ENABLE_FP4_E2M1"]
+    return gen_jit_spec(
+        uri,
+        source_paths,
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
 def gen_trtllm_gen_fmha_module():
     from ...artifacts import ArtifactPath, CheckSumHash
 

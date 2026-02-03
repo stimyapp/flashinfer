@@ -18,7 +18,7 @@ import torch
 
 import flashinfer
 from flashinfer.prefill import fmha_varlen_fp4kv
-from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
+from flashinfer.utils import is_sm100a_supported, is_sm110a_supported, is_sm120a_supported
 
 
 # E2M1 lookup table: nibble -> float value
@@ -227,8 +227,9 @@ def test_cutlass_fmha_fp4kv(
         pytest.skip("qo_len > kv_len and causal is not supported")
 
     if (not is_sm100a_supported(torch.device("cuda"))
-            and not is_sm110a_supported(torch.device("cuda"))):
-        pytest.skip("Requires SM100A or SM110A (Blackwell tcgen05)")
+            and not is_sm110a_supported(torch.device("cuda"))
+            and not is_sm120a_supported(torch.device("cuda"))):
+        pytest.skip("Requires SM100A, SM110A, or SM120A")
 
     torch.manual_seed(42)
 
@@ -368,8 +369,9 @@ def test_cutlass_fmha_fp4kv_varlen(
 ):
     """Test CUTLASS FMHA with E2M1 KV on variable-length sequences."""
     if (not is_sm100a_supported(torch.device("cuda"))
-            and not is_sm110a_supported(torch.device("cuda"))):
-        pytest.skip("Requires SM100A or SM110A (Blackwell tcgen05)")
+            and not is_sm110a_supported(torch.device("cuda"))
+            and not is_sm120a_supported(torch.device("cuda"))):
+        pytest.skip("Requires SM100A, SM110A, or SM120A")
 
     torch.manual_seed(42)
 
@@ -468,8 +470,9 @@ def test_cutlass_fmha_fp4kv_qo_kv_varlen(
 ):
     """Test CUTLASS FMHA with E2M1 KV where QO and KV have different lengths."""
     if (not is_sm100a_supported(torch.device("cuda"))
-            and not is_sm110a_supported(torch.device("cuda"))):
-        pytest.skip("Requires SM100A or SM110A (Blackwell tcgen05)")
+            and not is_sm110a_supported(torch.device("cuda"))
+            and not is_sm120a_supported(torch.device("cuda"))):
+        pytest.skip("Requires SM100A, SM110A, or SM120A")
 
     torch.manual_seed(42)
     sm_scale = 1.0 / math.sqrt(head_dim)
@@ -545,8 +548,9 @@ def test_cutlass_fmha_fp4kv_qo_kv_varlen(
 def test_cutlass_fmha_fp4kv_output_dtype():
     """Verify that the output is always BF16 regardless of input FP8 Q."""
     if (not is_sm100a_supported(torch.device("cuda"))
-            and not is_sm110a_supported(torch.device("cuda"))):
-        pytest.skip("Requires SM100A or SM110A (Blackwell tcgen05)")
+            and not is_sm110a_supported(torch.device("cuda"))
+            and not is_sm120a_supported(torch.device("cuda"))):
+        pytest.skip("Requires SM100A, SM110A, or SM120A")
 
     torch.manual_seed(42)
     batch_size, qo_len, kv_len = 1, 16, 32

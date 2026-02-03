@@ -27,6 +27,7 @@ from .jit import (
     gen_batch_prefill_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
+    gen_fmha_cutlass_sm120_module,
     gen_single_prefill_module,
     get_batch_prefill_uri,
     get_single_prefill_uri,
@@ -100,11 +101,21 @@ def get_fmha_module(
     device: torch.device,
     use_fp16_qk_reduction: bool = False,
 ):
-    if (
+    if is_sm120a_supported(device) or is_sm121a_supported(device):
+        return gen_fmha_cutlass_sm120_module(
+            dtype_q,
+            dtype_kv,
+            dtype_o,
+            dtype_idx,
+            head_dim_qk,
+            head_dim_vo,
+            pos_encoding_mode,
+            use_sliding_window,
+            use_logits_soft_cap,
+        ).build_and_load()
+    elif (
         is_sm100a_supported(device)
         or is_sm110a_supported(device)
-        or is_sm120a_supported(device)
-        or is_sm121a_supported(device)
     ):
         return gen_fmha_cutlass_sm100a_module(
             dtype_q,
@@ -118,7 +129,7 @@ def get_fmha_module(
             use_logits_soft_cap,
         ).build_and_load()
     else:
-        raise ValueError("SM100A is not supported on this device")
+        raise ValueError("SM100A or SM120A is not supported on this device")
 
 
 def make_hashable_cache(func):
@@ -3138,6 +3149,7 @@ def fmha_varlen_plan(
     kv_segment_offsets: torch.Tensor,
     num_qo_heads: int,
     causal: bool,
+    qo_tile_size: int = 256,
 ):
     num_ctas = torch.cuda.get_device_properties(
         qo_segment_offsets.device
@@ -3161,7 +3173,7 @@ def fmha_varlen_plan(
         qo_tile_indices,
         head_indices,
         batch_indices,
-        256,  # qo_tile_size
+        qo_tile_size,
         num_qo_heads,
         num_ctas,
         causal,
@@ -3389,9 +3401,19 @@ def fmha_varlen_fp4kv(
     if max_qo_len is None:
         max_qo_len = torch.max(qo_segment_offsets[1:] - qo_segment_offsets[:-1]).item()
 
+    # SM120 has no internal tile scheduler: each CTA handles exactly one
+    # CTA_Q=128 tile, so the plan must generate tiles at that granularity.
+    # SM100/SM110 use an internal tile scheduler that further splits 256-token
+    # blocks into smaller CTA_Q tiles, so the plan uses 256.
+    if is_sm120a_supported(q.device) or is_sm121a_supported(q.device):
+        qo_tile_size = 128
+    else:
+        qo_tile_size = 256
+
     if plan_info is None:
         plan_info = fmha_varlen_plan(
-            module, qo_segment_offsets, kv_segment_offsets, num_qo_heads, causal
+            module, qo_segment_offsets, kv_segment_offsets, num_qo_heads, causal,
+            qo_tile_size=qo_tile_size,
         )
 
     work_indptr, qo_tile_indices, head_indices, batch_indices = plan_info
